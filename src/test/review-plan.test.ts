@@ -2,24 +2,7 @@ import { describe, it, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import esmock from "esmock";
 import type { FeedbackItem } from "../reviewer.js";
-
-interface IndexModule {
-  // We don't import the server — we test the tool handler indirectly
-  // by importing the module's registered tool callback
-}
-
-// Since the tool handler is registered inline in index.ts and not directly
-// exportable, we test the integration by importing index.ts with mocks
-// and verifying the server's behavior through the transport.
-
-// For unit testing, we focus on the reviewer module (covered in reviewer.test.ts)
-// and test the tool handler's integration behavior here.
-
-function makeSummary(feedback: FeedbackItem[]): string {
-  return feedback.length === 0
-    ? "No issues found — plan looks solid."
-    : `Found ${feedback.length} item(s) to review.`;
-}
+import { clearAllSessions } from "../sessions.js";
 
 const feedbackItems: FeedbackItem[] = [
   {
@@ -36,16 +19,13 @@ const feedbackItems: FeedbackItem[] = [
   },
 ];
 
-describe("review_plan tool integration", () => {
-  describe("with feedback items", () => {
-    it("formats feedback and summary correctly", async () => {
-      // Mock the reviewer to return known feedback
-      const { loadConfig } = (await esmock("../config.js", {
-        fs: {
-          readFileSync: () => JSON.stringify({ model: "test-model" }),
-        },
-      })) as { loadConfig: () => import("../config.js").Config };
+describe("review_plan tool (paginated)", () => {
+  beforeEach(() => {
+    clearAllSessions();
+  });
 
+  describe("reviewer integration", () => {
+    it("returns parsed feedback items from reviewer", async () => {
       const { reviewPlan } = (await esmock("../reviewer.js", {
         "@anthropic-ai/sdk": {
           default: class {
@@ -60,18 +40,19 @@ describe("review_plan tool integration", () => {
         },
       })) as { reviewPlan: typeof import("../reviewer.js").reviewPlan };
 
-      const config = loadConfig();
-      const feedback = await reviewPlan("test plan", config);
+      const feedback = await reviewPlan("test plan", {
+        model: "test-model",
+      });
 
       assert.equal(feedback.length, 2);
       assert.equal(feedback[0].category, "risk");
+      assert.equal(feedback[0].title, "No rollback plan");
       assert.equal(feedback[1].category, "testing");
-      assert.equal(makeSummary(feedback), "Found 2 item(s) to review.");
     });
   });
 
-  describe("with empty feedback", () => {
-    it("reports plan is solid", async () => {
+  describe("empty feedback", () => {
+    it("returns empty array for clean plan", async () => {
       const { reviewPlan } = (await esmock("../reviewer.js", {
         "@anthropic-ai/sdk": {
           default: class {
@@ -88,7 +69,6 @@ describe("review_plan tool integration", () => {
         model: "test-model",
       });
       assert.deepEqual(feedback, []);
-      assert.equal(makeSummary(feedback), "No issues found — plan looks solid.");
     });
   });
 
@@ -111,5 +91,66 @@ describe("review_plan tool integration", () => {
         { message: /Rate limited/ },
       );
     });
+  });
+});
+
+describe("paginated session flow", () => {
+  beforeEach(() => {
+    clearAllSessions();
+  });
+
+  it("full accept/skip flow returns correct summary", async () => {
+    const {
+      createSession,
+      getSession,
+      recordDecision,
+      deleteSession,
+    } = await import("../sessions.js");
+
+    const reviewId = createSession(feedbackItems);
+    const session = getSession(reviewId)!;
+
+    // First item visible
+    assert.equal(session.currentIndex, 0);
+    assert.equal(session.feedback[0].title, "No rollback plan");
+
+    // User accepts first item
+    recordDecision(reviewId, "accept");
+    assert.equal(session.currentIndex, 1);
+    assert.equal(session.feedback[1].title, "Missing integration tests");
+
+    // User skips second item
+    recordDecision(reviewId, "skip");
+    assert.equal(session.currentIndex, 2);
+
+    // Build summary (mirrors index.ts logic)
+    const accepted: string[] = [];
+    const skipped: string[] = [];
+    for (let i = 0; i < session.feedback.length; i++) {
+      if (session.decisions[i] === "accept") {
+        accepted.push(session.feedback[i].title);
+      } else {
+        skipped.push(session.feedback[i].title);
+      }
+    }
+
+    assert.deepEqual(accepted, ["No rollback plan"]);
+    assert.deepEqual(skipped, ["Missing integration tests"]);
+
+    // Cleanup
+    deleteSession(reviewId);
+    assert.equal(getSession(reviewId), undefined);
+  });
+
+  it("submit_decision on completed session throws", async () => {
+    const { createSession, recordDecision } = await import("../sessions.js");
+
+    const reviewId = createSession([feedbackItems[0]]);
+    recordDecision(reviewId, "accept");
+
+    assert.throws(
+      () => recordDecision(reviewId, "skip"),
+      /already been decided/,
+    );
   });
 });

@@ -1,26 +1,51 @@
 # mcp-plan-review
 
-MCP server that sends implementation plans to a separate Claude instance for independent architectural review. Returns structured feedback items for human triage (accept/skip).
+MCP server that sends implementation plans to a separate Claude instance for independent architectural review. Returns feedback items one at a time via paginated sessions for human triage (accept/skip).
 
-## Tool
+## Tools
 
 | Name | Description |
 |------|-------------|
-| `review_plan` | Send a plan to an independent Claude reviewer. Returns JSON with categorized feedback items. |
+| `review_plan` | Send a plan to an independent Claude reviewer. Returns a session ID and the first feedback item. |
+| `submit_decision` | Record accept/skip for the current item. Returns the next item, or the final summary when all items are decided. |
 
-### Input
+### `review_plan`
 
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `plan` | string | The full plan text to review |
+**Input**: `{ plan: string }`
 
-### Output
+**Output** (has feedback):
+```json
+{ "review_id": "uuid", "total": 7, "current_index": 0, "item": { "category": "...", "title": "...", "description": "...", "suggestion": "..." } }
+```
 
-JSON object with:
-- `feedback`: Array of `{ category, title, description, suggestion }` items
-- `summary`: Human-readable summary string
+**Output** (no feedback):
+```json
+{ "review_id": "uuid", "total": 0, "done": true, "accepted": [], "skipped": [] }
+```
 
-Categories: `completeness`, `risk`, `edge_case`, `architecture`, `dependency`, `testing`, `error_handling`, `clarity`, `other`
+### `submit_decision`
+
+**Input**: `{ review_id: string, decision: "accept" | "skip" }`
+
+**Output** (next item):
+```json
+{ "review_id": "uuid", "current_index": 1, "total": 7, "item": { ... } }
+```
+
+**Output** (all decided):
+```json
+{ "review_id": "uuid", "done": true, "accepted": ["title1", "title2"], "skipped": ["title3"] }
+```
+
+### Categories
+
+`completeness`, `risk`, `edge_case`, `architecture`, `dependency`, `testing`, `error_handling`, `clarity`, `other`
+
+### How triage works
+
+`review_plan` sends the plan to an independent reviewer and returns only the first feedback item. Claude presents it to the user. The user says accept or skip. Claude calls `submit_decision` with the user's choice and gets the next item. This repeats until all items are triaged.
+
+Claude only ever sees one item at a time — it cannot batch-apply, summarize, or cherry-pick feedback. Sessions expire after 30 minutes of inactivity.
 
 ## Setup
 
@@ -63,23 +88,41 @@ Config values override environment variables. All fields are optional.
 ### Register with Claude Code
 
 ```bash
-claude mcp add --scope user \
+claude mcp add mcp-plan-review --scope user \
   -e ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY \
   -e REVIEW_MODEL=claude-sonnet-4-6 \
-  mcp-plan-review -- node ~/Projects/mcp-plan-review/build/index.js
+  -- node ~/Projects/mcp-plan-review/build/index.js
 ```
 
-## Usage
+## Skill Setup
 
-In Claude Code, the tool is available as `review_plan`. The intended workflow:
+The review-plan skill orchestrates the review workflow: locating the plan, calling the paginated tools, presenting each item for user triage, revising the plan, and optionally re-reviewing.
 
-1. Claude Code calls `review_plan(plan_text)` after drafting a plan
-2. Server sends the plan to an independent Claude reviewer
-3. Reviewer returns structured feedback items
-4. Claude Code presents each item for user triage (accept/skip)
-5. Accepted feedback is incorporated into the plan
-6. If any feedback was accepted, repeat from step 1
-7. Done when reviewer returns no issues or user skips all remaining items
+### Install
+
+```bash
+ln -s ~/Projects/mcp-plan-review/skill ~/.claude/skills/review-plan
+```
+
+### Usage
+
+After drafting a plan, invoke the skill:
+
+```
+/review-plan
+```
+
+The skill also auto-triggers when Claude detects a plan review context.
+
+### What it does
+
+1. Locates the plan (file path, conversation context, or asks you)
+2. Calls `review_plan` — gets first feedback item
+3. Presents the item, asks accept or skip
+4. Calls `submit_decision` with your choice — gets next item
+5. Repeats until all items triaged
+6. Revises the plan with only accepted feedback
+7. Optionally re-reviews (up to 3 rounds)
 
 ## Development
 
